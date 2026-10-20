@@ -1,0 +1,2616 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import jwt from "jsonwebtoken";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
+import Stripe from "stripe";
+import cookieParser from "cookie-parser";
+
+dotenv.config();
+
+const app = express();
+const port = process.env.PORT || 5000;
+
+// Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Middleware
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "http://localhost:5174",
+      process.env.CLIENT_URL,
+    ],
+    credentials: true,
+  })
+);
+
+// Stripe webhook needs raw body, so we handle it before JSON middleware
+app.post(
+  "/api/webhook/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the checkout.session.completed event
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      try {
+        await ensureConnection();
+
+        // Check if payment already exists
+        const existingPayment = await paymentsCollection.findOne({
+          transactionId: session.payment_intent,
+        });
+
+        if (!existingPayment && session.payment_status === "paid") {
+          const payment = {
+            bookingId: session.metadata?.bookingId,
+            userEmail: session.customer_email,
+            amount: session.amount_total / 100,
+            transactionId: session.payment_intent,
+            serviceName: session.metadata?.serviceName || "Unknown Service",
+            createdAt: new Date(),
+          };
+
+          const paymentResult = await paymentsCollection.insertOne(payment);
+
+          if (session.metadata?.bookingId) {
+            await bookingsCollection.updateOne(
+              { _id: new ObjectId(session.metadata.bookingId) },
+              {
+                $set: {
+                  isPaid: true,
+                  paymentId: paymentResult.insertedId.toString(),
+                  paidAt: new Date(),
+                },
+              }
+            );
+          }
+        }
+      } catch (error) {
+        console.error("Webhook processing error:", error);
+        return res.status(500).send("Webhook processing failed");
+      }
+    }
+
+    res.json({ received: true });
+  }
+);
+
+app.use(express.json());
+app.use(cookieParser());
+
+// MongoDB Connection
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@lumoracluster.y65imfg.mongodb.net/?appName=LumoraCluster`;
+
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: false,
+    deprecationErrors: true,
+  },
+  maxPoolSize: 10,
+  minPoolSize: 1,
+});
+
+// JWT Verification Middleware
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).send({ message: "Unauthorized access" });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).send({ message: "Unauthorized access" });
+    }
+    req.user = decoded;
+    next();
+  });
+};
+
+// Verify Admin
+const verifyAdmin = async (req, res, next) => {
+  const email = req.user.email;
+  const user = await usersCollection.findOne({ email });
+
+  if (user?.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+  next();
+};
+
+// Verify Decorator
+const verifyDecorator = async (req, res, next) => {
+  const email = req.user.email;
+  const user = await usersCollection.findOne({ email });
+
+  if (user?.role !== "decorator" && user?.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+  next();
+};
+
+let usersCollection;
+let servicesCollection;
+let bookingsCollection;
+let paymentsCollection;
+let reviewsCollection;
+let siteSettingsCollection;
+let promotionsCollection;
+
+let isConnected = false;
+let connectionPromise = null;
+
+// Ensure MongoDB connection before handling requests
+async function ensureConnection() {
+  if (isConnected) return;
+
+  if (!connectionPromise) {
+    connectionPromise = (async () => {
+      try {
+        await client.connect();
+        isConnected = true;
+        console.log("Connected to MongoDB!");
+
+        const database = client.db("LumoraDB");
+        usersCollection = database.collection("users");
+        servicesCollection = database.collection("services");
+        bookingsCollection = database.collection("bookings");
+        paymentsCollection = database.collection("payments");
+        reviewsCollection = database.collection("reviews");
+        siteSettingsCollection = database.collection("siteSettings");
+        promotionsCollection = database.collection("promotions");
+
+        // Singleton site settings seed (created once if missing)
+        const settingsCount = await siteSettingsCollection.countDocuments();
+        if (settingsCount === 0) {
+          await siteSettingsCollection.insertOne({
+            primary: "#8CC0EB",
+            accent: "#5B9BD5",
+            text: "#14202C",
+            bg: "#FFF9D2",
+            cream: "#FFF9D2",
+            peach: "#FFEBCC",
+            skysoft: "#BFDDF0",
+            logoUrl: "",
+            brandName: "Lumora",
+            updatedAt: new Date(),
+          });
+        }
+        await promotionsCollection.createIndex({ active: 1 });
+
+        // Create indexes
+        await servicesCollection.createIndex({
+          service_name: "text",
+          description: "text",
+        });
+        await bookingsCollection.createIndex({ userEmail: 1 });
+        await bookingsCollection.createIndex({ decoratorEmail: 1 });
+      } catch (error) {
+        console.error("MongoDB connection error:", error);
+        connectionPromise = null; // Reset on error to allow retry
+        throw error;
+      }
+    })();
+  }
+
+  return connectionPromise;
+}
+
+// Middleware to ensure DB connection before route handlers
+const ensureDB = async (req, res, next) => {
+  try {
+    await ensureConnection();
+    next();
+  } catch (error) {
+    res.status(500).send({ message: "Database connection failed" });
+  }
+};
+
+// Initialize connection (non-blocking)
+ensureConnection().catch(console.error);
+
+// ==================== AUTH ROUTES ====================
+
+// Generate JWT
+app.post("/api/jwt", async (req, res) => {
+  const user = req.body;
+  const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: "7d" });
+  res.send({ token });
+});
+
+// ==================== USER ROUTES ====================
+
+// Create or Update User
+app.post("/api/users", ensureDB, async (req, res) => {
+  const user = req.body;
+  const query = { email: user.email };
+  const existingUser = await usersCollection.findOne(query);
+
+  if (existingUser) {
+    return res.send({ message: "User already exists", insertedId: null });
+  }
+
+  const result = await usersCollection.insertOne({
+    ...user,
+    role: "user",
+    createdAt: new Date(),
+  });
+  res.send(result);
+});
+
+// Get User by Email
+app.get("/api/users/:email", ensureDB, verifyToken, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.user.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+
+  const user = await usersCollection.findOne({ email });
+  res.send(user);
+});
+
+// Get All Users (Admin only)
+app.get("/api/users", ensureDB, verifyToken, verifyAdmin, async (req, res) => {
+  const result = await usersCollection.find().toArray();
+  res.send(result);
+});
+
+// Update User Role (Admin only)
+app.patch(
+  "/api/users/:id/role",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const id = req.params.id;
+    const { role, isApproved } = req.body;
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        role,
+        isApproved: isApproved !== undefined ? isApproved : true,
+        updatedAt: new Date(),
+      },
+    };
+
+    const result = await usersCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  }
+);
+
+// Get All Decorators
+app.get("/api/decorators", ensureDB, async (req, res) => {
+  const { search } = req.query;
+  let query = { role: "decorator", isApproved: true };
+
+  if (search) {
+    query.$or = [
+      { displayName: { $regex: search, $options: "i" } },
+      { specialty: { $regex: search, $options: "i" } },
+    ];
+  }
+
+  const decorators = await usersCollection.find(query).toArray();
+  res.send(decorators);
+});
+
+// Update Decorator Profile
+app.patch(
+  "/api/decorators/:email",
+  ensureDB,
+  verifyToken,
+  verifyDecorator,
+  async (req, res) => {
+    const email = req.params.email;
+    const updates = req.body;
+
+    if (email !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const filter = { email };
+    const updateDoc = {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+    };
+
+    const result = await usersCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  }
+);
+
+// ==================== SERVICE ROUTES ====================
+
+// Get All Services
+app.get("/api/services", ensureDB, async (req, res) => {
+  const {
+    search,
+    category,
+    minPrice,
+    maxPrice,
+    page = 1,
+    limit = 12,
+    sort,
+  } = req.query;
+
+  let query = {};
+
+  if (search) {
+    query.$text = { $search: search };
+  }
+
+  if (category && category !== "all") {
+    query.service_category = category;
+  }
+
+  if (minPrice || maxPrice) {
+    query.cost = {};
+    if (minPrice) query.cost.$gte = parseFloat(minPrice);
+    if (maxPrice) query.cost.$lte = parseFloat(maxPrice);
+  }
+
+  let sortOptions = {};
+  if (sort === "price_asc") sortOptions.cost = 1;
+  if (sort === "price_desc") sortOptions.cost = -1;
+  if (sort === "newest") sortOptions.createdAt = -1;
+
+  const skip = (parseInt(page) - 1) * parseInt(limit);
+
+  const services = await servicesCollection
+    .find(query)
+    .sort(sortOptions)
+    .skip(skip)
+    .limit(parseInt(limit))
+    .toArray();
+
+  const total = await servicesCollection.countDocuments(query);
+
+  res.send({
+    services,
+    total,
+    page: parseInt(page),
+    totalPages: Math.ceil(total / parseInt(limit)),
+  });
+});
+
+// Get Service by ID
+app.get("/api/services/:id", ensureDB, async (req, res) => {
+  const id = req.params.id;
+  const service = await servicesCollection.findOne({
+    _id: new ObjectId(id),
+  });
+  res.send(service);
+});
+
+// Create Service (Admin only)
+app.post(
+  "/api/services",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const service = {
+      ...req.body,
+      createdAt: new Date(),
+      bookingCount: 0,
+    };
+
+    const result = await servicesCollection.insertOne(service);
+    res.send(result);
+  }
+);
+
+// Update Service (Admin only)
+app.patch(
+  "/api/services/:id",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const id = req.params.id;
+    const updates = req.body;
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+    };
+
+    const result = await servicesCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  }
+);
+
+// Delete Service (Admin only)
+app.delete(
+  "/api/services/:id",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const id = req.params.id;
+    const result = await servicesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+    res.send(result);
+  }
+);
+
+// Get Service Categories
+app.get("/api/service-categories", ensureDB, async (req, res) => {
+  const categories = await servicesCollection.distinct("service_category");
+  res.send(categories);
+});
+
+// ==================== BOOKING ROUTES ====================
+
+// Create Booking
+app.post("/api/bookings", ensureDB, verifyToken, async (req, res) => {
+  const booking = {
+    ...req.body,
+    status: "pending",
+    isPaid: false,
+    createdAt: new Date(),
+  };
+
+  const result = await bookingsCollection.insertOne(booking);
+
+  // Increment booking count for service
+  await servicesCollection.updateOne(
+    { _id: new ObjectId(booking.serviceId) },
+    { $inc: { bookingCount: 1 } }
+  );
+
+  res.send(result);
+});
+
+// Get User Bookings
+app.get(
+  "/api/bookings/user/:email",
+  ensureDB,
+  verifyToken,
+  async (req, res) => {
+    const email = req.params.email;
+    const { page = 1, limit = 10, sort } = req.query;
+
+    if (email !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    let sortOptions = { createdAt: -1 };
+    if (sort === "date_asc") sortOptions = { bookingDate: 1 };
+    if (sort === "date_desc") sortOptions = { bookingDate: -1 };
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const bookings = await bookingsCollection
+      .find({ userEmail: email })
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
+
+    const total = await bookingsCollection.countDocuments({
+      userEmail: email,
+    });
+
+    res.send({
+      bookings,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  }
+);
+
+// Get Decorator Bookings
+app.get(
+  "/api/bookings/decorator/:email",
+  ensureDB,
+  verifyToken,
+  verifyDecorator,
+  async (req, res) => {
+    const email = req.params.email;
+
+    if (email !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const bookings = await bookingsCollection
+      .find({ decoratorEmail: email })
+      .sort({ bookingDate: 1 })
+      .toArray();
+
+    res.send(bookings);
+  }
+);
+
+// Get All Bookings (Admin only)
+app.get(
+  "/api/bookings",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { status, sort } = req.query;
+
+    let query = {};
+    if (status && status !== "all") {
+      query.status = status;
+    }
+
+    let sortOptions = { createdAt: -1 };
+    if (sort === "date") sortOptions = { bookingDate: -1 };
+
+    const bookings = await bookingsCollection
+      .find(query)
+      .sort(sortOptions)
+      .toArray();
+    res.send(bookings);
+  }
+);
+
+// Get Single Booking
+app.get("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const booking = await bookingsCollection.findOne({
+    _id: new ObjectId(id),
+  });
+  res.send(booking);
+});
+
+// Update Booking
+app.patch("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const updates = req.body;
+
+  const filter = { _id: new ObjectId(id) };
+  const updateDoc = {
+    $set: {
+      ...updates,
+      updatedAt: new Date(),
+    },
+  };
+
+  const result = await bookingsCollection.updateOne(filter, updateDoc);
+  res.send(result);
+});
+
+// Assign Decorator (Admin only)
+app.patch(
+  "/api/bookings/:id/assign",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const id = req.params.id;
+    const { decoratorEmail, decoratorName } = req.body;
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        decoratorEmail,
+        decoratorName,
+        status: "assigned",
+        assignedAt: new Date(),
+      },
+    };
+
+    const result = await bookingsCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  }
+);
+
+// Update Project Status (Decorator)
+app.patch(
+  "/api/bookings/:id/status",
+  ensureDB,
+  verifyToken,
+  verifyDecorator,
+  async (req, res) => {
+    const id = req.params.id;
+    const { status } = req.body;
+
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        status,
+        [`statusHistory.${status}`]: new Date(),
+      },
+    };
+
+    const result = await bookingsCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  }
+);
+
+// Cancel Booking
+app.delete("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const booking = await bookingsCollection.findOne({
+    _id: new ObjectId(id),
+  });
+
+  if (booking.userEmail !== req.user.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+
+  if (booking.isPaid) {
+    return res.status(400).send({
+      message: "Cannot cancel paid booking. Please contact support.",
+    });
+  }
+
+  const result = await bookingsCollection.deleteOne({
+    _id: new ObjectId(id),
+  });
+  res.send(result);
+});
+
+// ==================== PAYMENT ROUTES ====================
+
+// Create Payment Intent
+app.post("/api/create-payment-intent", verifyToken, async (req, res) => {
+  const { amount } = req.body;
+  const amountInCents = Math.round(amount * 100);
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: amountInCents,
+    currency: "bdt",
+    payment_method_types: ["card"],
+  });
+
+  res.send({ clientSecret: paymentIntent.client_secret });
+});
+
+// Save Payment
+app.post("/api/payments", ensureDB, verifyToken, async (req, res) => {
+  const payment = {
+    ...req.body,
+    createdAt: new Date(),
+  };
+
+  const result = await paymentsCollection.insertOne(payment);
+
+  // Update booking payment status
+  await bookingsCollection.updateOne(
+    { _id: new ObjectId(payment.bookingId) },
+    {
+      $set: {
+        isPaid: true,
+        paymentId: result.insertedId.toString(),
+        paidAt: new Date(),
+      },
+    }
+  );
+
+  res.send(result);
+});
+
+// Get User Payments
+app.get(
+  "/api/payments/user/:email",
+  ensureDB,
+  verifyToken,
+  async (req, res) => {
+    const email = req.params.email;
+
+    if (email !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const payments = await paymentsCollection
+      .find({ userEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(payments);
+  }
+);
+
+// Create Checkout Session
+app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
+  try {
+    const { bookingId, amount, serviceName, userEmail } = req.body;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "bdt",
+            product_data: {
+              name: serviceName,
+              description: "Professional Decoration Service",
+            },
+            unit_amount: Math.round(amount * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel?booking_id=${bookingId}`,
+      customer_email: userEmail,
+      metadata: {
+        bookingId: bookingId,
+        serviceName: serviceName,
+      },
+    });
+
+    res.send({ sessionId: session.id, url: session.url });
+  } catch (error) {
+    console.error("Checkout session error:", error);
+    res.status(500).send({ message: "Failed to create checkout session" });
+  }
+});
+
+// Verify Payment and Update Booking (Client-side verification)
+app.post("/api/verify-payment", ensureDB, verifyToken, async (req, res) => {
+  try {
+    const { sessionId, bookingId } = req.body;
+
+    if (!sessionId || !bookingId) {
+      return res.status(400).send({
+        success: false,
+        message: "Missing sessionId or bookingId",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status === "paid") {
+      // Check if payment already exists
+      const existingPayment = await paymentsCollection.findOne({
+        transactionId: session.payment_intent,
+      });
+
+      if (existingPayment) {
+        return res.send({
+          success: true,
+          payment: existingPayment,
+          message: "Payment already verified",
+        });
+      }
+
+      const payment = {
+        bookingId,
+        userEmail: session.customer_email,
+        amount: session.amount_total / 100,
+        transactionId: session.payment_intent,
+        serviceName: session.metadata?.serviceName || "Unknown Service",
+        createdAt: new Date(),
+      };
+
+      const paymentResult = await paymentsCollection.insertOne(payment);
+
+      await bookingsCollection.updateOne(
+        { _id: new ObjectId(bookingId) },
+        {
+          $set: {
+            isPaid: true,
+            paymentId: paymentResult.insertedId.toString(),
+            paidAt: new Date(),
+          },
+        }
+      );
+
+      res.send({ success: true, payment });
+    } else {
+      res
+        .status(400)
+        .send({ success: false, message: "Payment not completed" });
+    }
+  } catch (error) {
+    console.error("Payment verification error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to verify payment",
+      error: error.message,
+    });
+  }
+});
+
+// Get Decorator Earnings
+app.get(
+  "/api/payments/decorator/:email",
+  ensureDB,
+  verifyToken,
+  verifyDecorator,
+  async (req, res) => {
+    const email = req.params.email;
+
+    if (email !== req.user.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const payments = await paymentsCollection
+      .find({ decoratorEmail: email })
+      .toArray();
+
+    const totalEarnings = payments.reduce((sum, p) => sum + p.amount, 0);
+
+    res.send({ payments, totalEarnings });
+  }
+);
+
+// Get All Payments (Admin only)
+app.get(
+  "/api/payments",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const payments = await paymentsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(payments);
+  }
+);
+
+// ==================== ANALYTICS ROUTES (Admin) ====================
+
+app.get(
+  "/api/analytics/dashboard",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const totalRevenue = await paymentsCollection
+        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+        .toArray();
+
+      const totalBookings = await bookingsCollection.countDocuments();
+      const paidBookings = await bookingsCollection.countDocuments({
+        isPaid: true,
+      });
+      const totalUsers = await usersCollection.countDocuments({
+        role: "user",
+      });
+      const totalDecorators = await usersCollection.countDocuments({
+        role: "decorator",
+      });
+
+      const serviceDemand = await bookingsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$serviceName",
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { count: -1 } },
+          { $limit: 10 },
+        ])
+        .toArray();
+
+      const monthlyRevenue = await paymentsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: {
+                month: { $month: "$createdAt" },
+                year: { $year: "$createdAt" },
+              },
+              revenue: { $sum: "$amount" },
+            },
+          },
+          { $sort: { "_id.year": 1, "_id.month": 1 } },
+        ])
+        .toArray();
+
+      res.send({
+        totalRevenue: totalRevenue[0]?.total || 0,
+        totalBookings,
+        paidBookings,
+        totalUsers,
+        totalDecorators,
+        serviceDemand,
+        monthlyRevenue,
+      });
+    } catch (error) {
+      console.error("Analytics error:", error);
+      res.status(500).send({
+        message: "Error fetching analytics",
+        totalRevenue: 0,
+        totalBookings: 0,
+        paidBookings: 0,
+        totalUsers: 0,
+        totalDecorators: 0,
+        serviceDemand: [],
+        monthlyRevenue: [],
+      });
+    }
+  }
+);
+
+// ==================== REVIEW ROUTES ====================
+
+app.post("/api/reviews", ensureDB, verifyToken, async (req, res) => {
+  const review = {
+    ...req.body,
+    createdAt: new Date(),
+  };
+
+  const result = await reviewsCollection.insertOne(review);
+  res.send(result);
+});
+
+app.get("/api/reviews/service/:serviceId", ensureDB, async (req, res) => {
+  const serviceId = req.params.serviceId;
+  const reviews = await reviewsCollection
+    .find({ serviceId })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(reviews);
+});
+
+// ==================== SITE SETTINGS ROUTES ====================
+// Public: anyone can read the current site settings (colors, logo, brand)
+app.get("/api/site-settings", ensureDB, async (req, res) => {
+  try {
+    const settings = await siteSettingsCollection.findOne({});
+    if (!settings) {
+      return res.send({
+        primary: "#8CC0EB",
+        accent: "#5B9BD5",
+        text: "#14202C",
+        bg: "#FFF9D2",
+        cream: "#FFF9D2",
+        peach: "#FFEBCC",
+        skysoft: "#BFDDF0",
+        logoUrl: "",
+        brandName: "Lumora",
+      });
+    }
+    res.send(settings);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to load site settings" });
+  }
+});
+
+// Admin only: update the site settings (singleton document)
+app.put(
+  "/api/site-settings",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const allowed = {
+        primary: body.primary,
+        accent: body.accent,
+        text: body.text,
+        bg: body.bg,
+        cream: body.cream,
+        peach: body.peach,
+        skysoft: body.skysoft,
+        logoUrl: body.logoUrl,
+        brandName: body.brandName,
+        updatedAt: new Date(),
+      };
+      // Strip undefined keys so we always keep existing values
+      Object.keys(allowed).forEach((k) => {
+        if (allowed[k] === undefined) delete allowed[k];
+      });
+      const result = await siteSettingsCollection.updateOne(
+        {},
+        { $set: allowed },
+        { upsert: true }
+      );
+      const updated = await siteSettingsCollection.findOne({});
+      res.send({ message: "Site settings updated", settings: updated, result });
+    } catch (error) {
+      console.error("Update settings error:", error);
+      res.status(500).send({ message: "Failed to update site settings" });
+    }
+  }
+);
+
+// ==================== PROMOTIONS ROUTES ====================
+// Public: get the single active promotion for the auto-open modal
+app.get("/api/promotions/active", ensureDB, async (req, res) => {
+  try {
+    const now = new Date();
+    const promo = await promotionsCollection.findOne({
+      active: true,
+      $and: [
+        {
+          $or: [
+            { startDate: { $exists: false } },
+            { startDate: null },
+            { startDate: { $lte: now } },
+          ],
+        },
+        {
+          $or: [
+            { endDate: { $exists: false } },
+            { endDate: null },
+            { endDate: { $gte: now } },
+          ],
+        },
+      ],
+    });
+    res.send(promo || null);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to load promotion" });
+  }
+});
+
+// Admin only: list all promotions
+app.get(
+  "/api/promotions",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const list = await promotionsCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.send(list);
+    } catch (error) {
+      res.status(500).send({ message: "Failed to load promotions" });
+    }
+  }
+);
+
+// Admin only: create a promotion
+app.post(
+  "/api/promotions",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const promo = {
+        title: req.body.title || "Special Offer",
+        message: req.body.message || "",
+        imageUrl: req.body.imageUrl || "",
+        ctaText: req.body.ctaText || "Learn more",
+        ctaLink: req.body.ctaLink || "",
+        active: req.body.active !== false,
+        startDate: req.body.startDate ? new Date(req.body.startDate) : null,
+        endDate: req.body.endDate ? new Date(req.body.endDate) : null,
+        createdAt: new Date(),
+      };
+      const result = await promotionsCollection.insertOne(promo);
+      res.send({ message: "Promotion created", promotion: promo, result });
+    } catch (error) {
+      res.status(500).send({ message: "Failed to create promotion" });
+    }
+  }
+);
+
+// Admin only: update a promotion
+app.put(
+  "/api/promotions/:id",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const update = {};
+      [
+        "title",
+        "message",
+        "imageUrl",
+        "ctaText",
+        "ctaLink",
+        "active",
+        "startDate",
+        "endDate",
+      ].forEach((k) => {
+        if (req.body[k] !== undefined) {
+          update[k] =
+            k === "startDate" || k === "endDate"
+              ? req.body[k]
+                ? new Date(req.body[k])
+                : null
+              : req.body[k];
+        }
+      });
+      const result = await promotionsCollection.updateOne(
+        { _id: new (await import("mongodb")).ObjectId(id) },
+        { $set: update }
+      );
+      res.send({ message: "Promotion updated", result });
+    } catch (error) {
+      res.status(500).send({ message: "Failed to update promotion" });
+    }
+  }
+);
+
+// Admin only: delete a promotion
+app.delete(
+  "/api/promotions/:id",
+  ensureDB,
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const result = await promotionsCollection.deleteOne({
+        _id: new (await import("mongodb")).ObjectId(id),
+      });
+      res.send({ message: "Promotion deleted", result });
+    } catch (error) {
+      res.status(500).send({ message: "Failed to delete promotion" });
+    }
+  }
+);
+
+// ********************** Don't touch this section ******************************************
+// Health check
+// app.get("/health", (req, res) => {
+//   res.send({ status: "OK", timestamp: new Date() });
+// });
+
+// Root route
+// app.get("/", (req, res) => {
+//   res.send("Lumora Server is running");
+// });
+
+// CRITICAL: Export for Vercel serverless
+// export default app;
+
+// ************************************* TO THIS *******************************************
+
+// Health check
+app.get("/health", (req, res) => {
+  res.send({ status: "OK", timestamp: new Date() });
+});
+
+// Root route
+app.get("/", (req, res) => {
+  res.send("Lumora Server is running");
+});
+
+// Start server locally
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`Lumora Server is running on port ${port}`);
+  });
+}
+
+// Export for Vercel serverless
+export default app;
+
+
+// import express from "express";
+// import cors from "cors";
+// import dotenv from "dotenv";
+// import jwt from "jsonwebtoken";
+// import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
+// import Stripe from "stripe";
+// import cookieParser from "cookie-parser";
+// import admin from "firebase-admin";
+// import nodemailer from "nodemailer";
+// import { readFileSync } from "node:fs";
+// import crypto from "node:crypto";
+// import { initializeApp, cert, getApps } from "firebase-admin/app";
+// import { getAuth } from "firebase-admin/auth";
+
+// dotenv.config();
+
+// // Firebase Admin: used to mark a user's email as verified after OTP verification.
+// const serviceAccount = JSON.parse(
+//   readFileSync(new URL("./serviceAccountKey.json", import.meta.url), "utf8")
+// );
+
+// if (getApps().length === 0) {
+//   initializeApp({
+//     credential: cert(serviceAccount),
+//   });
+// }
+
+// const firebaseAdminAuth = getAuth();
+
+// // Gmail SMTP transporter for sending email verification OTPs.
+// const mailTransporter = nodemailer.createTransport({
+//   service: "gmail",
+//   auth: {
+//     user: process.env.SMTP_USER,
+//     pass: process.env.SMTP_PASS,
+//   },
+// });
+
+// const app = express();
+// const port = process.env.PORT || 5000;
+
+// // Stripe
+// const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// // Middleware
+// app.use(
+//   cors({
+//     origin: [
+//       "http://localhost:5173",
+//       "http://localhost:5174",
+//       process.env.CLIENT_URL,
+//     ],
+//     credentials: true,
+//   })
+// );
+
+// // Stripe webhook needs raw body, so we handle it before JSON middleware
+// app.post(
+//   "/api/webhook/stripe",
+//   express.raw({ type: "application/json" }),
+//   async (req, res) => {
+//     const sig = req.headers["stripe-signature"];
+//     let event;
+
+//     try {
+//       event = stripe.webhooks.constructEvent(
+//         req.body,
+//         sig,
+//         process.env.STRIPE_WEBHOOK_SECRET
+//       );
+//     } catch (err) {
+//       console.error("Webhook signature verification failed:", err.message);
+//       return res.status(400).send(`Webhook Error: ${err.message}`);
+//     }
+
+//     // Handle the checkout.session.completed event
+//     if (event.type === "checkout.session.completed") {
+//       const session = event.data.object;
+
+//       try {
+//         await ensureConnection();
+
+//         // Check if payment already exists
+//         const existingPayment = await paymentsCollection.findOne({
+//           transactionId: session.payment_intent,
+//         });
+
+//         if (!existingPayment && session.payment_status === "paid") {
+//           const payment = {
+//             bookingId: session.metadata?.bookingId,
+//             userEmail: session.customer_email,
+//             amount: session.amount_total / 100,
+//             transactionId: session.payment_intent,
+//             serviceName: session.metadata?.serviceName || "Unknown Service",
+//             createdAt: new Date(),
+//           };
+
+//           const paymentResult = await paymentsCollection.insertOne(payment);
+
+//           if (session.metadata?.bookingId) {
+//             await bookingsCollection.updateOne(
+//               { _id: new ObjectId(session.metadata.bookingId) },
+//               {
+//                 $set: {
+//                   isPaid: true,
+//                   paymentId: paymentResult.insertedId.toString(),
+//                   paidAt: new Date(),
+//                 },
+//               }
+//             );
+//           }
+//         }
+//       } catch (error) {
+//         console.error("Webhook processing error:", error);
+//         return res.status(500).send("Webhook processing failed");
+//       }
+//     }
+
+//     res.json({ received: true });
+//   }
+// );
+
+// app.use(express.json());
+// app.use(cookieParser());
+
+// // MongoDB Connection
+// const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@lumoracluster.y65imfg.mongodb.net/?appName=LumoraCluster`;
+
+// const client = new MongoClient(uri, {
+//   serverApi: {
+//     version: ServerApiVersion.v1,
+//     strict: false,
+//     deprecationErrors: true,
+//   },
+//   maxPoolSize: 10,
+//   minPoolSize: 1,
+// });
+
+// // JWT Verification Middleware
+// const verifyToken = (req, res, next) => {
+//   const token = req.headers.authorization?.split(" ")[1];
+
+//   if (!token) {
+//     return res.status(401).send({ message: "Unauthorized access" });
+//   }
+
+//   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+//     if (err) {
+//       return res.status(401).send({ message: "Unauthorized access" });
+//     }
+//     req.user = decoded;
+//     next();
+//   });
+// };
+
+// // Verify Admin
+// const verifyAdmin = async (req, res, next) => {
+//   const email = req.user.email;
+//   const user = await usersCollection.findOne({ email });
+
+//   if (user?.role !== "admin") {
+//     return res.status(403).send({ message: "Forbidden access" });
+//   }
+//   next();
+// };
+
+// // Verify Decorator
+// const verifyDecorator = async (req, res, next) => {
+//   const email = req.user.email;
+//   const user = await usersCollection.findOne({ email });
+
+//   if (user?.role !== "decorator" && user?.role !== "admin") {
+//     return res.status(403).send({ message: "Forbidden access" });
+//   }
+//   next();
+// };
+
+// let usersCollection;
+// let servicesCollection;
+// let bookingsCollection;
+// let paymentsCollection;
+// let reviewsCollection;
+// let siteSettingsCollection;
+// let promotionsCollection;
+// let emailOtpsCollection;
+
+// let isConnected = false;
+// let connectionPromise = null;
+
+// // Ensure MongoDB connection before handling requests
+// async function ensureConnection() {
+//   if (isConnected) return;
+
+//   if (!connectionPromise) {
+//     connectionPromise = (async () => {
+//       try {
+//         await client.connect();
+//         isConnected = true;
+//         console.log("Connected to MongoDB!");
+
+//         const database = client.db("LumoraDB");
+//         usersCollection = database.collection("users");
+//         servicesCollection = database.collection("services");
+//         bookingsCollection = database.collection("bookings");
+//         paymentsCollection = database.collection("payments");
+//         reviewsCollection = database.collection("reviews");
+//         siteSettingsCollection = database.collection("siteSettings");
+//         promotionsCollection = database.collection("promotions");
+//         emailOtpsCollection = database.collection("emailOtps");
+//         await emailOtpsCollection.createIndex(
+//           { expiresAt: 1 },
+//           { expireAfterSeconds: 0 }
+//         );
+
+//         // Singleton site settings seed (created once if missing)
+//         const settingsCount = await siteSettingsCollection.countDocuments();
+//         if (settingsCount === 0) {
+//           await siteSettingsCollection.insertOne({
+//             primary: "#8CC0EB",
+//             accent: "#5B9BD5",
+//             text: "#14202C",
+//             bg: "#FFF9D2",
+//             cream: "#FFF9D2",
+//             peach: "#FFEBCC",
+//             skysoft: "#BFDDF0",
+//             logoUrl: "",
+//             brandName: "Lumora",
+//             updatedAt: new Date(),
+//           });
+//         }
+//         await promotionsCollection.createIndex({ active: 1 });
+
+//         // Create indexes
+//         await servicesCollection.createIndex({
+//           service_name: "text",
+//           description: "text",
+//         });
+//         await bookingsCollection.createIndex({ userEmail: 1 });
+//         await bookingsCollection.createIndex({ decoratorEmail: 1 });
+//       } catch (error) {
+//         console.error("MongoDB connection error:", error);
+//         connectionPromise = null; // Reset on error to allow retry
+//         throw error;
+//       }
+//     })();
+//   }
+
+//   return connectionPromise;
+// }
+
+// // Middleware to ensure DB connection before route handlers
+// const ensureDB = async (req, res, next) => {
+//   try {
+//     await ensureConnection();
+//     next();
+//   } catch (error) {
+//     res.status(500).send({ message: "Database connection failed" });
+//   }
+// };
+
+// // ==================== EMAIL OTP ROUTES ====================
+// // OTPs are stored as HMAC hashes, expire after 5 minutes, and allow 5 attempts.
+// const hashOtp = (email, otp) => {
+//   if (!process.env.OTP_SECRET) {
+//     throw new Error("OTP_SECRET is missing from the environment variables");
+//   }
+
+//   return crypto
+//     .createHmac("sha256", process.env.OTP_SECRET)
+//     .update(`${email.toLowerCase()}:${otp}`)
+//     .digest("hex");
+// };
+
+// app.post("/api/email-otp/send", ensureDB, async (req, res) => {
+//   try {
+//     const email = String(req.body.email || "").trim().toLowerCase();
+
+//     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+//       return res.status(400).send({ message: "Valid email is required" });
+//     }
+
+//     if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !process.env.OTP_SECRET) {
+//       console.error("OTP configuration is missing (SMTP_USER, SMTP_PASS, or OTP_SECRET)");
+//       return res.status(500).send({ message: "Email verification is not configured" });
+//     }
+
+//     const existingUser = await usersCollection.findOne({ email });
+//     if (existingUser) {
+//       return res.status(409).send({ message: "An account with this email already exists" });
+//     }
+
+//     const previous = await emailOtpsCollection.findOne({ email });
+//     const now = Date.now();
+
+//     if (previous?.lastSentAt && now - new Date(previous.lastSentAt).getTime() < 60_000) {
+//       return res.status(429).send({ message: "Please wait 60 seconds before requesting another OTP" });
+//     }
+
+//     const otp = crypto.randomInt(100000, 1000000).toString();
+//     await emailOtpsCollection.replaceOne(
+//       { email },
+//       {
+//         email,
+//         otpHash: hashOtp(email, otp),
+//         attempts: 0,
+//         verifiedAt: null,
+//         lastSentAt: new Date(now),
+//         expiresAt: new Date(now + 5 * 60 * 1000),
+//       },
+//       { upsert: true }
+//     );
+
+//     try {
+//       await mailTransporter.sendMail({
+//         from: process.env.SMTP_USER,
+//         to: email,
+//         subject: "Your Lumora verification code",
+//         text: `Your Lumora verification code is ${otp}. It expires in 5 minutes. Do not share this code with anyone.`,
+//         html: `
+//           <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px">
+//             <h2>Verify your Lumora email</h2>
+//             <p>Your verification code is:</p>
+//             <div style="font-size:32px;font-weight:bold;letter-spacing:8px">${otp}</div>
+//             <p>This code expires in 5 minutes.</p>
+//             <p>If you did not request this code, you can ignore this email.</p>
+//           </div>
+//         `,
+//       });
+//     } catch (mailError) {
+//       await emailOtpsCollection.deleteOne({ email });
+//       throw mailError;
+//     }
+
+//     return res.send({ message: "OTP sent successfully" });
+//   } catch (error) {
+//     console.error("OTP send error:", error.message);
+//     return res.status(500).send({ message: "Could not send OTP" });
+//   }
+// });
+
+// app.post("/api/email-otp/verify", ensureDB, async (req, res) => {
+//   try {
+//     const email = String(req.body.email || "").trim().toLowerCase();
+//     const otp = String(req.body.otp || "").trim();
+
+//     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+//       return res.status(400).send({ message: "Valid email is required" });
+//     }
+//     if (!/^\d{6}$/.test(otp)) {
+//       return res.status(400).send({ message: "Enter a valid 6-digit OTP" });
+//     }
+
+//     const record = await emailOtpsCollection.findOne({ email });
+//     if (!record || new Date(record.expiresAt) <= new Date()) {
+//       return res.status(400).send({ message: "OTP expired. Please request a new one" });
+//     }
+//     if (record.verifiedAt) {
+//       return res.send({ message: "Email already verified for registration" });
+//     }
+//     if (record.attempts >= 5) {
+//       return res.status(429).send({ message: "Too many incorrect attempts. Request a new OTP" });
+//     }
+
+//     const submittedHash = hashOtp(email, otp);
+//     const submitted = Buffer.from(submittedHash, "hex");
+//     const saved = Buffer.from(record.otpHash, "hex");
+//     const matches = submitted.length === saved.length && crypto.timingSafeEqual(submitted, saved);
+
+//     if (!matches) {
+//       await emailOtpsCollection.updateOne({ email }, { $inc: { attempts: 1 } });
+//       return res.status(400).send({ message: "Incorrect OTP" });
+//     }
+
+//     await emailOtpsCollection.updateOne(
+//       { email },
+//       {
+//         $set: {
+//           verifiedAt: new Date(),
+//           // Give the user 10 minutes to finish Firebase account creation.
+//           expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+//         },
+//       }
+//     );
+
+//     return res.send({ message: "OTP verified successfully" });
+//   } catch (error) {
+//     console.error("OTP verification error:", error.message);
+//     return res.status(500).send({ message: "Could not verify OTP" });
+//   }
+// });
+
+// // Call this after OTP verification and Firebase account creation.
+// // The Firebase ID token proves which newly-created account is being updated.
+// app.post("/api/email-otp/complete", ensureDB, async (req, res) => {
+//   try {
+//     const authorization = req.headers.authorization || "";
+//     const firebaseIdToken = authorization.startsWith("Bearer ")
+//       ? authorization.slice(7)
+//       : "";
+
+//     if (!firebaseIdToken) {
+//       return res.status(401).send({ message: "Firebase token required" });
+//     }
+
+//     const decoded = await firebaseAdminAuth.verifyIdToken(firebaseIdToken);
+//     const email = String(decoded.email || "").trim().toLowerCase();
+
+//     if (!email || !decoded.uid) {
+//       return res.status(401).send({ message: "Invalid Firebase account" });
+//     }
+
+//     const record = await emailOtpsCollection.findOne({ email });
+//     if (!record || !record.verifiedAt || new Date(record.expiresAt) <= new Date()) {
+//       return res.status(400).send({ message: "Please verify your email with OTP first" });
+//     }
+
+//     await firebaseAdminAuth.updateUser(decoded.uid, { emailVerified: true });
+//     await emailOtpsCollection.deleteOne({ email });
+
+//     return res.send({ message: "Firebase email verified successfully" });
+//   } catch (error) {
+//     console.error("OTP completion error:", error.message);
+//     return res.status(401).send({ message: "Could not complete email verification" });
+//   }
+// });
+
+// // Initialize connection (non-blocking)
+// ensureConnection().catch(console.error);
+
+// // ==================== AUTH ROUTES ====================
+
+// // Generate JWT
+// app.post("/api/jwt", async (req, res) => {
+//   const user = req.body;
+//   const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: "7d" });
+//   res.send({ token });
+// });
+
+// // ==================== USER ROUTES ====================
+
+// // Create or Update User
+// app.post("/api/users", ensureDB, async (req, res) => {
+//   const user = req.body;
+//   const query = { email: user.email };
+//   const existingUser = await usersCollection.findOne(query);
+
+//   if (existingUser) {
+//     return res.send({ message: "User already exists", insertedId: null });
+//   }
+
+//   const result = await usersCollection.insertOne({
+//     ...user,
+//     role: "user",
+//     createdAt: new Date(),
+//   });
+//   res.send(result);
+// });
+
+// // Get User by Email
+// app.get("/api/users/:email", ensureDB, verifyToken, async (req, res) => {
+//   const email = req.params.email;
+
+//   if (email !== req.user.email) {
+//     return res.status(403).send({ message: "Forbidden access" });
+//   }
+
+//   const user = await usersCollection.findOne({ email });
+//   res.send(user);
+// });
+
+// // Get All Users (Admin only)
+// app.get("/api/users", ensureDB, verifyToken, verifyAdmin, async (req, res) => {
+//   const result = await usersCollection.find().toArray();
+//   res.send(result);
+// });
+
+// // Update User Role (Admin only)
+// app.patch(
+//   "/api/users/:id/role",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const id = req.params.id;
+//     const { role, isApproved } = req.body;
+
+//     const filter = { _id: new ObjectId(id) };
+//     const updateDoc = {
+//       $set: {
+//         role,
+//         isApproved: isApproved !== undefined ? isApproved : true,
+//         updatedAt: new Date(),
+//       },
+//     };
+
+//     const result = await usersCollection.updateOne(filter, updateDoc);
+//     res.send(result);
+//   }
+// );
+
+// // Get All Decorators
+// app.get("/api/decorators", ensureDB, async (req, res) => {
+//   const { search } = req.query;
+//   let query = { role: "decorator", isApproved: true };
+
+//   if (search) {
+//     query.$or = [
+//       { displayName: { $regex: search, $options: "i" } },
+//       { specialty: { $regex: search, $options: "i" } },
+//     ];
+//   }
+
+//   const decorators = await usersCollection.find(query).toArray();
+//   res.send(decorators);
+// });
+
+// // Update Decorator Profile
+// app.patch(
+//   "/api/decorators/:email",
+//   ensureDB,
+//   verifyToken,
+//   verifyDecorator,
+//   async (req, res) => {
+//     const email = req.params.email;
+//     const updates = req.body;
+
+//     if (email !== req.user.email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     const filter = { email };
+//     const updateDoc = {
+//       $set: {
+//         ...updates,
+//         updatedAt: new Date(),
+//       },
+//     };
+
+//     const result = await usersCollection.updateOne(filter, updateDoc);
+//     res.send(result);
+//   }
+// );
+
+// // ==================== SERVICE ROUTES ====================
+
+// // Get All Services
+// app.get("/api/services", ensureDB, async (req, res) => {
+//   const {
+//     search,
+//     category,
+//     minPrice,
+//     maxPrice,
+//     page = 1,
+//     limit = 12,
+//     sort,
+//   } = req.query;
+
+//   let query = {};
+
+//   if (search) {
+//     query.$text = { $search: search };
+//   }
+
+//   if (category && category !== "all") {
+//     query.service_category = category;
+//   }
+
+//   if (minPrice || maxPrice) {
+//     query.cost = {};
+//     if (minPrice) query.cost.$gte = parseFloat(minPrice);
+//     if (maxPrice) query.cost.$lte = parseFloat(maxPrice);
+//   }
+
+//   let sortOptions = {};
+//   if (sort === "price_asc") sortOptions.cost = 1;
+//   if (sort === "price_desc") sortOptions.cost = -1;
+//   if (sort === "newest") sortOptions.createdAt = -1;
+
+//   const skip = (parseInt(page) - 1) * parseInt(limit);
+
+//   const services = await servicesCollection
+//     .find(query)
+//     .sort(sortOptions)
+//     .skip(skip)
+//     .limit(parseInt(limit))
+//     .toArray();
+
+//   const total = await servicesCollection.countDocuments(query);
+
+//   res.send({
+//     services,
+//     total,
+//     page: parseInt(page),
+//     totalPages: Math.ceil(total / parseInt(limit)),
+//   });
+// });
+
+// // Get Service by ID
+// app.get("/api/services/:id", ensureDB, async (req, res) => {
+//   const id = req.params.id;
+//   const service = await servicesCollection.findOne({
+//     _id: new ObjectId(id),
+//   });
+//   res.send(service);
+// });
+
+// // Create Service (Admin only)
+// app.post(
+//   "/api/services",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const service = {
+//       ...req.body,
+//       createdAt: new Date(),
+//       bookingCount: 0,
+//     };
+
+//     const result = await servicesCollection.insertOne(service);
+//     res.send(result);
+//   }
+// );
+
+// // Update Service (Admin only)
+// app.patch(
+//   "/api/services/:id",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const id = req.params.id;
+//     const updates = req.body;
+
+//     const filter = { _id: new ObjectId(id) };
+//     const updateDoc = {
+//       $set: {
+//         ...updates,
+//         updatedAt: new Date(),
+//       },
+//     };
+
+//     const result = await servicesCollection.updateOne(filter, updateDoc);
+//     res.send(result);
+//   }
+// );
+
+// // Delete Service (Admin only)
+// app.delete(
+//   "/api/services/:id",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const id = req.params.id;
+//     const result = await servicesCollection.deleteOne({
+//       _id: new ObjectId(id),
+//     });
+//     res.send(result);
+//   }
+// );
+
+// // Get Service Categories
+// app.get("/api/service-categories", ensureDB, async (req, res) => {
+//   const categories = await servicesCollection.distinct("service_category");
+//   res.send(categories);
+// });
+
+// // ==================== BOOKING ROUTES ====================
+
+// // Create Booking
+// app.post("/api/bookings", ensureDB, verifyToken, async (req, res) => {
+//   const booking = {
+//     ...req.body,
+//     status: "pending",
+//     isPaid: false,
+//     createdAt: new Date(),
+//   };
+
+//   const result = await bookingsCollection.insertOne(booking);
+
+//   // Increment booking count for service
+//   await servicesCollection.updateOne(
+//     { _id: new ObjectId(booking.serviceId) },
+//     { $inc: { bookingCount: 1 } }
+//   );
+
+//   res.send(result);
+// });
+
+// // Get User Bookings
+// app.get(
+//   "/api/bookings/user/:email",
+//   ensureDB,
+//   verifyToken,
+//   async (req, res) => {
+//     const email = req.params.email;
+//     const { page = 1, limit = 10, sort } = req.query;
+
+//     if (email !== req.user.email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     let sortOptions = { createdAt: -1 };
+//     if (sort === "date_asc") sortOptions = { bookingDate: 1 };
+//     if (sort === "date_desc") sortOptions = { bookingDate: -1 };
+
+//     const skip = (parseInt(page) - 1) * parseInt(limit);
+
+//     const bookings = await bookingsCollection
+//       .find({ userEmail: email })
+//       .sort(sortOptions)
+//       .skip(skip)
+//       .limit(parseInt(limit))
+//       .toArray();
+
+//     const total = await bookingsCollection.countDocuments({
+//       userEmail: email,
+//     });
+
+//     res.send({
+//       bookings,
+//       total,
+//       page: parseInt(page),
+//       totalPages: Math.ceil(total / parseInt(limit)),
+//     });
+//   }
+// );
+
+// // Get Decorator Bookings
+// app.get(
+//   "/api/bookings/decorator/:email",
+//   ensureDB,
+//   verifyToken,
+//   verifyDecorator,
+//   async (req, res) => {
+//     const email = req.params.email;
+
+//     if (email !== req.user.email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     const bookings = await bookingsCollection
+//       .find({ decoratorEmail: email })
+//       .sort({ bookingDate: 1 })
+//       .toArray();
+
+//     res.send(bookings);
+//   }
+// );
+
+// // Get All Bookings (Admin only)
+// app.get(
+//   "/api/bookings",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const { status, sort } = req.query;
+
+//     let query = {};
+//     if (status && status !== "all") {
+//       query.status = status;
+//     }
+
+//     let sortOptions = { createdAt: -1 };
+//     if (sort === "date") sortOptions = { bookingDate: -1 };
+
+//     const bookings = await bookingsCollection
+//       .find(query)
+//       .sort(sortOptions)
+//       .toArray();
+//     res.send(bookings);
+//   }
+// );
+
+// // Get Single Booking
+// app.get("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+//   const id = req.params.id;
+//   const booking = await bookingsCollection.findOne({
+//     _id: new ObjectId(id),
+//   });
+//   res.send(booking);
+// });
+
+// // Update Booking
+// app.patch("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+//   const id = req.params.id;
+//   const updates = req.body;
+
+//   const filter = { _id: new ObjectId(id) };
+//   const updateDoc = {
+//     $set: {
+//       ...updates,
+//       updatedAt: new Date(),
+//     },
+//   };
+
+//   const result = await bookingsCollection.updateOne(filter, updateDoc);
+//   res.send(result);
+// });
+
+// // Assign Decorator (Admin only)
+// app.patch(
+//   "/api/bookings/:id/assign",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const id = req.params.id;
+//     const { decoratorEmail, decoratorName } = req.body;
+
+//     const filter = { _id: new ObjectId(id) };
+//     const updateDoc = {
+//       $set: {
+//         decoratorEmail,
+//         decoratorName,
+//         status: "assigned",
+//         assignedAt: new Date(),
+//       },
+//     };
+
+//     const result = await bookingsCollection.updateOne(filter, updateDoc);
+//     res.send(result);
+//   }
+// );
+
+// // Update Project Status (Decorator)
+// app.patch(
+//   "/api/bookings/:id/status",
+//   ensureDB,
+//   verifyToken,
+//   verifyDecorator,
+//   async (req, res) => {
+//     const id = req.params.id;
+//     const { status } = req.body;
+
+//     const filter = { _id: new ObjectId(id) };
+//     const updateDoc = {
+//       $set: {
+//         status,
+//         [`statusHistory.${status}`]: new Date(),
+//       },
+//     };
+
+//     const result = await bookingsCollection.updateOne(filter, updateDoc);
+//     res.send(result);
+//   }
+// );
+
+// // Cancel Booking
+// app.delete("/api/bookings/:id", ensureDB, verifyToken, async (req, res) => {
+//   const id = req.params.id;
+//   const booking = await bookingsCollection.findOne({
+//     _id: new ObjectId(id),
+//   });
+
+//   if (booking.userEmail !== req.user.email) {
+//     return res.status(403).send({ message: "Forbidden access" });
+//   }
+
+//   if (booking.isPaid) {
+//     return res.status(400).send({
+//       message: "Cannot cancel paid booking. Please contact support.",
+//     });
+//   }
+
+//   const result = await bookingsCollection.deleteOne({
+//     _id: new ObjectId(id),
+//   });
+//   res.send(result);
+// });
+
+// // ==================== PAYMENT ROUTES ====================
+
+// // Create Payment Intent
+// app.post("/api/create-payment-intent", verifyToken, async (req, res) => {
+//   const { amount } = req.body;
+//   const amountInCents = Math.round(amount * 100);
+
+//   const paymentIntent = await stripe.paymentIntents.create({
+//     amount: amountInCents,
+//     currency: "bdt",
+//     payment_method_types: ["card"],
+//   });
+
+//   res.send({ clientSecret: paymentIntent.client_secret });
+// });
+
+// // Save Payment
+// app.post("/api/payments", ensureDB, verifyToken, async (req, res) => {
+//   const payment = {
+//     ...req.body,
+//     createdAt: new Date(),
+//   };
+
+//   const result = await paymentsCollection.insertOne(payment);
+
+//   // Update booking payment status
+//   await bookingsCollection.updateOne(
+//     { _id: new ObjectId(payment.bookingId) },
+//     {
+//       $set: {
+//         isPaid: true,
+//         paymentId: result.insertedId.toString(),
+//         paidAt: new Date(),
+//       },
+//     }
+//   );
+
+//   res.send(result);
+// });
+
+// // Get User Payments
+// app.get(
+//   "/api/payments/user/:email",
+//   ensureDB,
+//   verifyToken,
+//   async (req, res) => {
+//     const email = req.params.email;
+
+//     if (email !== req.user.email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     const payments = await paymentsCollection
+//       .find({ userEmail: email })
+//       .sort({ createdAt: -1 })
+//       .toArray();
+
+//     res.send(payments);
+//   }
+// );
+
+// // Create Checkout Session
+// app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
+//   try {
+//     const { bookingId, amount, serviceName, userEmail } = req.body;
+
+//     const session = await stripe.checkout.sessions.create({
+//       payment_method_types: ["card"],
+//       line_items: [
+//         {
+//           price_data: {
+//             currency: "bdt",
+//             product_data: {
+//               name: serviceName,
+//               description: "Professional Decoration Service",
+//             },
+//             unit_amount: Math.round(amount * 100),
+//           },
+//           quantity: 1,
+//         },
+//       ],
+//       mode: "payment",
+//       success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
+//       cancel_url: `${process.env.CLIENT_URL}/payment/cancel?booking_id=${bookingId}`,
+//       customer_email: userEmail,
+//       metadata: {
+//         bookingId: bookingId,
+//         serviceName: serviceName,
+//       },
+//     });
+
+//     res.send({ sessionId: session.id, url: session.url });
+//   } catch (error) {
+//     console.error("Checkout session error:", error);
+//     res.status(500).send({ message: "Failed to create checkout session" });
+//   }
+// });
+
+// // Verify Payment and Update Booking (Client-side verification)
+// app.post("/api/verify-payment", ensureDB, verifyToken, async (req, res) => {
+//   try {
+//     const { sessionId, bookingId } = req.body;
+
+//     if (!sessionId || !bookingId) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Missing sessionId or bookingId",
+//       });
+//     }
+
+//     const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+//     if (session.payment_status === "paid") {
+//       // Check if payment already exists
+//       const existingPayment = await paymentsCollection.findOne({
+//         transactionId: session.payment_intent,
+//       });
+
+//       if (existingPayment) {
+//         return res.send({
+//           success: true,
+//           payment: existingPayment,
+//           message: "Payment already verified",
+//         });
+//       }
+
+//       const payment = {
+//         bookingId,
+//         userEmail: session.customer_email,
+//         amount: session.amount_total / 100,
+//         transactionId: session.payment_intent,
+//         serviceName: session.metadata?.serviceName || "Unknown Service",
+//         createdAt: new Date(),
+//       };
+
+//       const paymentResult = await paymentsCollection.insertOne(payment);
+
+//       await bookingsCollection.updateOne(
+//         { _id: new ObjectId(bookingId) },
+//         {
+//           $set: {
+//             isPaid: true,
+//             paymentId: paymentResult.insertedId.toString(),
+//             paidAt: new Date(),
+//           },
+//         }
+//       );
+
+//       res.send({ success: true, payment });
+//     } else {
+//       res
+//         .status(400)
+//         .send({ success: false, message: "Payment not completed" });
+//     }
+//   } catch (error) {
+//     console.error("Payment verification error:", error);
+//     res.status(500).send({
+//       success: false,
+//       message: "Failed to verify payment",
+//       error: error.message,
+//     });
+//   }
+// });
+
+// // Get Decorator Earnings
+// app.get(
+//   "/api/payments/decorator/:email",
+//   ensureDB,
+//   verifyToken,
+//   verifyDecorator,
+//   async (req, res) => {
+//     const email = req.params.email;
+
+//     if (email !== req.user.email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     const payments = await paymentsCollection
+//       .find({ decoratorEmail: email })
+//       .toArray();
+
+//     const totalEarnings = payments.reduce((sum, p) => sum + p.amount, 0);
+
+//     res.send({ payments, totalEarnings });
+//   }
+// );
+
+// // Get All Payments (Admin only)
+// app.get(
+//   "/api/payments",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     const payments = await paymentsCollection
+//       .find()
+//       .sort({ createdAt: -1 })
+//       .toArray();
+//     res.send(payments);
+//   }
+// );
+
+// // ==================== ANALYTICS ROUTES (Admin) ====================
+
+// app.get(
+//   "/api/analytics/dashboard",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const totalRevenue = await paymentsCollection
+//         .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+//         .toArray();
+
+//       const totalBookings = await bookingsCollection.countDocuments();
+//       const paidBookings = await bookingsCollection.countDocuments({
+//         isPaid: true,
+//       });
+//       const totalUsers = await usersCollection.countDocuments({
+//         role: "user",
+//       });
+//       const totalDecorators = await usersCollection.countDocuments({
+//         role: "decorator",
+//       });
+
+//       const serviceDemand = await bookingsCollection
+//         .aggregate([
+//           {
+//             $group: {
+//               _id: "$serviceName",
+//               count: { $sum: 1 },
+//             },
+//           },
+//           { $sort: { count: -1 } },
+//           { $limit: 10 },
+//         ])
+//         .toArray();
+
+//       const monthlyRevenue = await paymentsCollection
+//         .aggregate([
+//           {
+//             $group: {
+//               _id: {
+//                 month: { $month: "$createdAt" },
+//                 year: { $year: "$createdAt" },
+//               },
+//               revenue: { $sum: "$amount" },
+//             },
+//           },
+//           { $sort: { "_id.year": 1, "_id.month": 1 } },
+//         ])
+//         .toArray();
+
+//       res.send({
+//         totalRevenue: totalRevenue[0]?.total || 0,
+//         totalBookings,
+//         paidBookings,
+//         totalUsers,
+//         totalDecorators,
+//         serviceDemand,
+//         monthlyRevenue,
+//       });
+//     } catch (error) {
+//       console.error("Analytics error:", error);
+//       res.status(500).send({
+//         message: "Error fetching analytics",
+//         totalRevenue: 0,
+//         totalBookings: 0,
+//         paidBookings: 0,
+//         totalUsers: 0,
+//         totalDecorators: 0,
+//         serviceDemand: [],
+//         monthlyRevenue: [],
+//       });
+//     }
+//   }
+// );
+
+// // ==================== REVIEW ROUTES ====================
+
+// app.post("/api/reviews", ensureDB, verifyToken, async (req, res) => {
+//   const review = {
+//     ...req.body,
+//     createdAt: new Date(),
+//   };
+
+//   const result = await reviewsCollection.insertOne(review);
+//   res.send(result);
+// });
+
+// app.get("/api/reviews/service/:serviceId", ensureDB, async (req, res) => {
+//   const serviceId = req.params.serviceId;
+//   const reviews = await reviewsCollection
+//     .find({ serviceId })
+//     .sort({ createdAt: -1 })
+//     .toArray();
+
+//   res.send(reviews);
+// });
+
+// // ==================== SITE SETTINGS ROUTES ====================
+// // Public: anyone can read the current site settings (colors, logo, brand)
+// app.get("/api/site-settings", ensureDB, async (req, res) => {
+//   try {
+//     const settings = await siteSettingsCollection.findOne({});
+//     if (!settings) {
+//       return res.send({
+//         primary: "#8CC0EB",
+//         accent: "#5B9BD5",
+//         text: "#14202C",
+//         bg: "#FFF9D2",
+//         cream: "#FFF9D2",
+//         peach: "#FFEBCC",
+//         skysoft: "#BFDDF0",
+//         logoUrl: "",
+//         brandName: "Lumora",
+//       });
+//     }
+//     res.send(settings);
+//   } catch (error) {
+//     res.status(500).send({ message: "Failed to load site settings" });
+//   }
+// });
+
+// // Admin only: update the site settings (singleton document)
+// app.put(
+//   "/api/site-settings",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const body = req.body || {};
+//       const allowed = {
+//         primary: body.primary,
+//         accent: body.accent,
+//         text: body.text,
+//         bg: body.bg,
+//         cream: body.cream,
+//         peach: body.peach,
+//         skysoft: body.skysoft,
+//         logoUrl: body.logoUrl,
+//         brandName: body.brandName,
+//         updatedAt: new Date(),
+//       };
+//       // Strip undefined keys so we always keep existing values
+//       Object.keys(allowed).forEach((k) => {
+//         if (allowed[k] === undefined) delete allowed[k];
+//       });
+//       const result = await siteSettingsCollection.updateOne(
+//         {},
+//         { $set: allowed },
+//         { upsert: true }
+//       );
+//       const updated = await siteSettingsCollection.findOne({});
+//       res.send({ message: "Site settings updated", settings: updated, result });
+//     } catch (error) {
+//       console.error("Update settings error:", error);
+//       res.status(500).send({ message: "Failed to update site settings" });
+//     }
+//   }
+// );
+
+// // ==================== PROMOTIONS ROUTES ====================
+// // Public: get the single active promotion for the auto-open modal
+// app.get("/api/promotions/active", ensureDB, async (req, res) => {
+//   try {
+//     const now = new Date();
+//     const promo = await promotionsCollection.findOne({
+//       active: true,
+//       $and: [
+//         {
+//           $or: [
+//             { startDate: { $exists: false } },
+//             { startDate: null },
+//             { startDate: { $lte: now } },
+//           ],
+//         },
+//         {
+//           $or: [
+//             { endDate: { $exists: false } },
+//             { endDate: null },
+//             { endDate: { $gte: now } },
+//           ],
+//         },
+//       ],
+//     });
+//     res.send(promo || null);
+//   } catch (error) {
+//     res.status(500).send({ message: "Failed to load promotion" });
+//   }
+// });
+
+// // Admin only: list all promotions
+// app.get(
+//   "/api/promotions",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const list = await promotionsCollection
+//         .find({})
+//         .sort({ createdAt: -1 })
+//         .toArray();
+//       res.send(list);
+//     } catch (error) {
+//       res.status(500).send({ message: "Failed to load promotions" });
+//     }
+//   }
+// );
+
+// // Admin only: create a promotion
+// app.post(
+//   "/api/promotions",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const promo = {
+//         title: req.body.title || "Special Offer",
+//         message: req.body.message || "",
+//         imageUrl: req.body.imageUrl || "",
+//         ctaText: req.body.ctaText || "Learn more",
+//         ctaLink: req.body.ctaLink || "",
+//         active: req.body.active !== false,
+//         startDate: req.body.startDate ? new Date(req.body.startDate) : null,
+//         endDate: req.body.endDate ? new Date(req.body.endDate) : null,
+//         createdAt: new Date(),
+//       };
+//       const result = await promotionsCollection.insertOne(promo);
+//       res.send({ message: "Promotion created", promotion: promo, result });
+//     } catch (error) {
+//       res.status(500).send({ message: "Failed to create promotion" });
+//     }
+//   }
+// );
+
+// // Admin only: update a promotion
+// app.put(
+//   "/api/promotions/:id",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const id = req.params.id;
+//       const update = {};
+//       [
+//         "title",
+//         "message",
+//         "imageUrl",
+//         "ctaText",
+//         "ctaLink",
+//         "active",
+//         "startDate",
+//         "endDate",
+//       ].forEach((k) => {
+//         if (req.body[k] !== undefined) {
+//           update[k] =
+//             k === "startDate" || k === "endDate"
+//               ? req.body[k]
+//                 ? new Date(req.body[k])
+//                 : null
+//               : req.body[k];
+//         }
+//       });
+//       const result = await promotionsCollection.updateOne(
+//         { _id: new (await import("mongodb")).ObjectId(id) },
+//         { $set: update }
+//       );
+//       res.send({ message: "Promotion updated", result });
+//     } catch (error) {
+//       res.status(500).send({ message: "Failed to update promotion" });
+//     }
+//   }
+// );
+
+// // Admin only: delete a promotion
+// app.delete(
+//   "/api/promotions/:id",
+//   ensureDB,
+//   verifyToken,
+//   verifyAdmin,
+//   async (req, res) => {
+//     try {
+//       const id = req.params.id;
+//       const result = await promotionsCollection.deleteOne({
+//         _id: new (await import("mongodb")).ObjectId(id),
+//       });
+//       res.send({ message: "Promotion deleted", result });
+//     } catch (error) {
+//       res.status(500).send({ message: "Failed to delete promotion" });
+//     }
+//   }
+// );
+
+// // ********************** Don't touch this section ******************************************
+// // Health check
+// // app.get("/health", (req, res) => {
+// //   res.send({ status: "OK", timestamp: new Date() });
+// // });
+
+// // Root route
+// // app.get("/", (req, res) => {
+// //   res.send("Lumora Server is running");
+// // });
+
+// // CRITICAL: Export for Vercel serverless
+// // export default app;
+
+// // ************************************* TO THIS *******************************************
+
+// // Health check
+// app.get("/health", (req, res) => {
+//   res.send({ status: "OK", timestamp: new Date() });
+// });
+
+// // Root route
+// app.get("/", (req, res) => {
+//   res.send("Lumora Server is running");
+// });
+
+// // Start server locally
+// if (process.env.NODE_ENV !== "production") {
+//   app.listen(port, () => {
+//     console.log(`Lumora Server is running on port ${port}`);
+//   });
+// }
+
+// // Export for Vercel serverless
+// export default app;
