@@ -1,7 +1,15 @@
 node_modules/
 .env
+.env.bak
 .env.local
 .vercel
 npm-debug.log*
 .DS_Store
 .env*.local
+serviceAccountKey*.json
+
+.env
+.env.*
+!.env.example
+serviceAccountKey*.json
+*.bak
